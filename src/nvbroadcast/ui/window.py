@@ -390,10 +390,11 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         main_box.append(footer_box)
 
         def _update_perf():
-            pm = self._app.perf_monitor
-            self._perf_label.set_text(pm.format_status())
+            if self.get_mapped():
+                pm = self._app.perf_monitor
+                self._perf_label.set_text(pm.format_status())
             return True
-        GLib.timeout_add(1000, _update_perf)
+        GLib.timeout_add_seconds(1, _update_perf)
 
         self.set_content(main_box)
 
@@ -528,6 +529,15 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         self._mirror_toggle.connect("toggled", self._on_mirror_toggled)
         proc_card.append(self._mirror_toggle)
 
+        # Camera power save toggle
+        self._power_save_toggle = EffectToggle(
+            "Power Save",
+            "Pause camera while hidden and no app is using it"
+        )
+        self._power_save_toggle.active = True
+        self._power_save_toggle.connect("toggled", self._on_power_save_toggled)
+        proc_card.append(self._power_save_toggle)
+
         # Edge Refine toggle (visible only for Zeus/Killer)
         self._edge_refine_toggle = EffectToggle(
             "Edge Refine", "Neural edge refinement (Zeus/Killer)"
@@ -582,6 +592,14 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         self._blur_slider.set_sensitive(False)
         self._blur_slider.connect("value-changed", self._on_blur_changed)
         bg_card.append(self._blur_slider)
+        self._blur_dim_slider = EffectSlider("Dim", 0.0)
+        self._blur_dim_slider.set_sensitive(False)
+        self._blur_dim_slider.connect("value-changed", self._on_blur_dim_changed)
+        bg_card.append(self._blur_dim_slider)
+        self._blur_desat_slider = EffectSlider("Desaturate", 0.0)
+        self._blur_desat_slider.set_sensitive(False)
+        self._blur_desat_slider.connect("value-changed", self._on_blur_desat_changed)
+        bg_card.append(self._blur_desat_slider)
 
         # Advanced Edge Tuning (collapsible)
         adv_expander = Gtk.Expander(label="Advanced Edge Tuning")
@@ -780,6 +798,12 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         self._noise_slider.set_sensitive(False)
         self._noise_slider.connect("value-changed", self._on_noise_intensity_changed)
         mic_card.append(self._noise_slider)
+        self._noise_ai_toggle = EffectToggle(
+            "AI Denoiser", "DeepFilterNet neural noise removal (better quality)")
+        self._noise_ai_toggle.active = True
+        self._noise_ai_toggle.set_sensitive(False)
+        self._noise_ai_toggle.connect("toggled", self._on_noise_engine_toggled)
+        mic_card.append(self._noise_ai_toggle)
         box.append(self._build_collapsible_card("microphone", "Microphone", mic_card, expanded=True))
 
         # Voice Effects card
@@ -973,6 +997,8 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         self._app.set_bg_removal(active)
         self._bg_mode.set_sensitive(active)
         self._blur_slider.set_sensitive(active)
+        self._blur_dim_slider.set_sensitive(active)
+        self._blur_desat_slider.set_sensitive(active)
         self._quality_selector.set_sensitive(active)
         self._model_selector.set_sensitive(active)
         self._edge_dilate.set_sensitive(active)
@@ -1205,6 +1231,12 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
     def _on_blur_changed(self, s, v):
         self._app.set_blur_intensity(v)
 
+    def _on_blur_dim_changed(self, s, v):
+        self._app.set_blur_dim(v)
+
+    def _on_blur_desat_changed(self, s, v):
+        self._app.set_blur_desaturate(v)
+
     def _on_edge_dilate(self, s, v):
         self._app.set_edge_param("dilate_size", int(v))
 
@@ -1238,6 +1270,11 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
 
     def _on_mirror_toggled(self, t, active):
         self._app.set_mirror(active)
+
+    def _on_power_save_toggled(self, t, active):
+        if getattr(self._app, "_restoring", False):
+            return
+        self._app.set_auto_idle(active)
 
     def _on_edge_refine_toggled(self, t, active):
         self._app.set_edge_refine(active)
@@ -1697,6 +1734,7 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         self._bg_toggle.active = v.background_removal
         # Mirror
         self._mirror_toggle.active = v.mirror
+        self._power_save_toggle.active = getattr(config, "auto_idle", True)
         # Auto frame
         self._autoframe_toggle.active = v.auto_frame
         self._zoom_slider._scale.set_value(v.auto_frame_zoom)
@@ -1734,6 +1772,10 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         self._noise_toggle.active = a.noise_removal
         self._noise_slider.set_sensitive(a.noise_removal)
         self._noise_slider._scale.set_value(a.noise_intensity)
+        # Toggle on = "auto" (prefer DeepFilterNet, fall back to RNNoise);
+        # toggle off = pin the classic RNNoise engine.
+        self._noise_ai_toggle.active = a.noise_engine in ("auto", "deepfilter")
+        self._noise_ai_toggle.set_sensitive(a.noise_removal)
         self._speaker_toggle.active = a.speaker_denoise
         self._vfx_toggle.active = a.voice_fx_enabled
         self._vfx_preset.set_sensitive(a.voice_fx_enabled)
@@ -1761,6 +1803,12 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
             return
         self._app.set_noise_removal(active)
         self._noise_slider.set_sensitive(active)
+        self._noise_ai_toggle.set_sensitive(active)
+
+    def _on_noise_engine_toggled(self, t, active):
+        if getattr(self._app, "_restoring", False):
+            return
+        self._app.set_noise_engine("auto" if active else "rnnoise")
 
     def _on_noise_intensity_changed(self, s, v):
         if getattr(self._app, "_restoring", False):
@@ -1844,6 +1892,8 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
 
         # Sliders
         self._blur_slider._scale.set_value(v.blur_intensity)
+        self._blur_dim_slider._scale.set_value(getattr(v, "blur_dim", 0.0))
+        self._blur_desat_slider._scale.set_value(getattr(v, "blur_desaturate", 0.0))
         self._zoom_slider._scale.set_value(v.auto_frame_zoom)
         mode_map = {"center": 0, "stable": 1}
         self._autoframe_mode_selector.set_selected_index(mode_map.get(v.auto_frame_mode, 0))
@@ -1861,6 +1911,8 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
             self._bg_toggle.active = True
             self._bg_mode.set_sensitive(True)
             self._blur_slider.set_sensitive(True)
+            self._blur_dim_slider.set_sensitive(True)
+            self._blur_desat_slider.set_sensitive(True)
             self._quality_selector.set_sensitive(True)
             self._model_selector.set_sensitive(True)
             self._edge_dilate.set_sensitive(True)
@@ -1922,6 +1974,7 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
 
         # Mirror
         self._mirror_toggle.active = v.mirror
+        self._power_save_toggle.active = getattr(config, "auto_idle", True)
         self._profile_btn.set_label(f"Profile: {config.current_profile or 'Default'}")
 
     def sync_video_input_controls(self, config):

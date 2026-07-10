@@ -24,6 +24,8 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Adw, Gst, Gio, Gdk, GLib
 
 from nvbroadcast.core.constants import APP_ID, COMPUTE_GPU_INDEX, VIRTUAL_CAM_LABEL
+from nvbroadcast.core import startup_trace
+from nvbroadcast.core.gpu import apply_cuda_blocking_sync
 from nvbroadcast.core.config import load_config, save_config
 from nvbroadcast.core.updates import (
     fetch_latest_release,
@@ -40,6 +42,7 @@ from nvbroadcast.video.eye_contact import EyeContactCorrector
 from nvbroadcast.video.relighting import FaceRelighter
 from nvbroadcast.video.face_landmarks import get_shared_landmarker
 from nvbroadcast.video.perf_monitor import PerfMonitor
+from nvbroadcast.video.vcam_monitor import VcamConsumerMonitor
 from nvbroadcast.ai.transcriber import MeetingTranscriber, save_transcript
 from nvbroadcast.ai.summarizer import MeetingSummarizer
 from nvbroadcast.core.platform import (
@@ -112,6 +115,11 @@ class NVBroadcastApp(Adw.Application):
             application_id=APP_ID,
             flags=Gio.ApplicationFlags.FLAGS_NONE,
         )
+        # Must precede the first cupy/ORT CUDA call (primary-context creation)
+        # or GPU waits keep busy-spinning a core.
+        if apply_cuda_blocking_sync():
+            print("[NV Broadcast] CUDA blocking-sync enabled "
+                  "(NVBROADCAST_CUDA_SYNC=spin restores spin-wait)")
         self.config = load_config()
         if IS_LINUX and IS_ARM64 and self.config.mode_key in {
             "doczeus", "cuda_max", "cuda_balanced", "cuda_perf", "zeus", "killer",
@@ -126,6 +134,8 @@ class NVBroadcastApp(Adw.Application):
         self._window = None
         self._video_pipeline = None
         self._audio_pipeline = None
+        self._gpu_frame_path = None
+        self._gpu_frame_path_failed = False
         self._speaker_monitor = None
         self._video_effects = VideoEffects(
             gpu_index=self.config.compute_gpu,
@@ -161,10 +171,13 @@ class NVBroadcastApp(Adw.Application):
         self._transcriber_preload_started = False
         self._vcam_device = None
         self._vcam_available = False
+        self._vcam_monitor = None  # v4l2 client-usage watcher (Linux)
         self._mirror = True  # Default: mirror (like looking in a mirror)
         self._tray = None
         self._legacy_tray_enabled = legacy_tray_enabled()
         self._vcam_consumers = 0  # Track virtual camera consumers
+        self._idle_active = False   # Camera power save engaged
+        self._idle_strikes = 0      # Consecutive no-consumer polls
         self._streaming = False
         self._use_nvdec = self.config.use_nvdec
         self._inline_inference = self.config.performance_profile in ("max_quality", "balanced")
@@ -181,8 +194,10 @@ class NVBroadcastApp(Adw.Application):
         self._transcriber.set_segment_callback(self._on_transcript_segment)
 
     def do_startup(self):
+        startup_trace.mark("do_startup begin")
         Adw.Application.do_startup(self)
         Gst.init(None)
+        startup_trace.mark("Gst.init done")
         cleanup_old_sessions()
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
 
@@ -204,6 +219,21 @@ class NVBroadcastApp(Adw.Application):
             self._vcam_available = True
         except RuntimeError as e:
             print(f"[NV Broadcast] Virtual camera unavailable: {e}")
+        if self._vcam_available and not IS_MACOS:
+            # Started here — before any pipeline can open the device — so
+            # the monitor's own-fd baseline cannot race our own opens, and
+            # kept for the whole session so consumers stay visible across
+            # pipeline restarts.
+            monitor = VcamConsumerMonitor(
+                self._vcam_device, wake_callback=self._on_vcam_consumer_wake)
+            if monitor.start():
+                self._vcam_monitor = monitor
+                print("[NV Broadcast] Camera power save: v4l2 client-usage "
+                      "monitor active", flush=True)
+            else:
+                print("[NV Broadcast] Camera power save: v4l2 events "
+                      "unavailable, falling back to fuser", flush=True)
+        startup_trace.mark("do_startup end (virtual camera ready)")
 
     def _stop_headless_vcam_service(self) -> bool:
         """Stop the optional headless passthrough service before GUI capture.
@@ -246,30 +276,54 @@ class NVBroadcastApp(Adw.Application):
             return False
 
     def do_activate(self):
+        startup_trace.mark("do_activate begin")
         if self._window is None:
             self._window = NVBroadcastWindow(self)
+            startup_trace.mark("window constructed")
             self._window.bind_dependency_installer(self._dependency_installer)
             self._window.load_meeting_sessions(self.list_meeting_sessions())
 
-            # Legacy GTK3 AppIndicator tray is opt-in only. Mixing GTK3 tray
+            # Native SNI (StatusNotifierItem) tray — pure D-Bus, safe in a
+            # GTK4 process, works on KDE/Hyprland/waybar/quickshell.
+            try:
+                from nvbroadcast.ui.sni_tray import SniTray
+                self._tray = SniTray(self)
+            except Exception as e:
+                print(f"[NV Broadcast] SNI tray failed: {e}")
+                self._tray = None
+
+            # Legacy GTK3 AppIndicator tray as fallback. Mixing GTK3 tray
             # code into this GTK4 app can terminate startup natively on some
-            # Linux desktops without a Python traceback.
-            if self._legacy_tray_enabled:
+            # Linux desktops without a Python traceback, so it stays gated.
+            if (self._tray is None or not getattr(self._tray, "bus_ready", False)) \
+                    and self._legacy_tray_enabled:
                 try:
                     from nvbroadcast.ui.tray import TrayIcon
                     self._tray = TrayIcon(self)
                     if self._tray.available:
-                        print("[NV Broadcast] System tray icon active")
+                        print("[NV Broadcast] System tray icon active (legacy)")
                 except Exception as e:
                     print(f"[NV Broadcast] Tray icon not available: {e}")
-            else:
-                print(
-                    "[NV Broadcast] Legacy tray integration disabled. "
-                    "Set NVBROADCAST_ENABLE_LEGACY_TRAY=1 to force-enable it."
-                )
 
-            # Camera power save: poll for vcam consumers
-            GLib.timeout_add(5000, self._check_vcam_consumers)
+            # Showing the window must instantly wake camera power save, and
+            # preview textures are only worth building while it is visible.
+            def _on_window_mapped(*_a):
+                if self._idle_active:
+                    self._exit_idle("window shown")
+                if self._video_pipeline is not None:
+                    self._video_pipeline.set_preview_enabled(True)
+
+            def _on_window_unmapped(*_a):
+                if self._video_pipeline is not None:
+                    self._video_pipeline.set_preview_enabled(False)
+
+            self._window.connect("map", _on_window_mapped)
+            self._window.connect("unmap", _on_window_unmapped)
+
+            # Camera power save: poll for vcam consumers. Seconds-granularity
+            # so GLib can coalesce the wakeup; the 1s _idle_wake_tick handles
+            # fast wake-from-idle, this poll only latches idle entry.
+            GLib.timeout_add_seconds(10, self._check_vcam_consumers)
 
             # Start performance monitor
             self._perf_monitor.start()
@@ -282,6 +336,7 @@ class NVBroadcastApp(Adw.Application):
             # from resetting effect states during restore)
             self._restoring = True
             self._restore_settings()
+            startup_trace.mark("settings restored")
             if self.config.auto_mode:
                 self.set_auto_mode_enabled(True)
             else:
@@ -307,6 +362,9 @@ class NVBroadcastApp(Adw.Application):
 
         self._window.set_visible(True)
         self._window.present()
+        startup_trace.mark("window presented")
+        print(f"[NV Broadcast] Window up in {startup_trace.elapsed():.1f}s",
+              flush=True)
         self._maybe_show_python_runtime_notice()
 
     def _on_setup_complete(self, wizard, profile_name, gpu_index, compositing):
@@ -427,42 +485,164 @@ class NVBroadcastApp(Adw.Application):
             print("[NV Broadcast] No tray available; closing window will quit the app")
         return False  # Allow normal close
 
-    def _check_vcam_consumers(self):
-        """Poll virtual camera device for active consumers.
+    def _probe_vcam_consumers(self) -> int | None:
+        """Count external processes holding the vcam device.
 
-        Tracks consumer count for status display. Pipeline stays running
-        to avoid device conflicts with exclusive_caps=1 — stopping and
-        restarting the pipeline while a consumer holds the device causes
-        v4l2sink to fail ("not a output device").
+        Primary source is the v4l2loopback client-usage monitor: inside
+        the bubblewrap user namespace, fuser cannot stat other processes'
+        /proc/PID/fd links and silently reports zero consumers, which
+        used to freeze live calls. fuser remains only as a fallback when
+        the v4l2 event is unavailable, with a liveness guard against
+        exactly that blindness.
+
+        Returns None when the answer is not trustworthy — callers MUST
+        treat None as "camera in use" so a detection failure can never
+        freeze someone's camera.
         """
-        if not self._vcam_available:
-            return True  # Keep polling
-
         if IS_MACOS:
-            return True
-
+            return None
+        if self._vcam_monitor is not None and self._vcam_monitor.running:
+            return self._vcam_monitor.consumers()
+        import os
         import subprocess
         try:
             result = subprocess.run(
                 ["fuser", self._vcam_device or "/dev/video10"],
                 capture_output=True, text=True, timeout=2,
             )
-            pids = result.stdout.strip().split()
-            import os
-            own_pid = str(os.getpid())
-            consumers = [p for p in pids if p.strip() and p.strip() != own_pid]
-            new_count = len(consumers)
         except Exception:
-            new_count = self._vcam_consumers
+            return None
+        # fuser: 0 = at least one accessor, 1 = none (or failure — but then
+        # stdout is empty either way, which is the safe reading).
+        if result.returncode not in (0, 1):
+            return None
+        own_pid = str(os.getpid())
+        count = 0
+        own_seen = False
+        for token in result.stdout.split():
+            pid = "".join(ch for ch in token if ch.isdigit())
+            if not pid:
+                continue
+            if pid == own_pid:
+                own_seen = True
+            else:
+                count += 1
+        pipeline_holds_device = (
+            self._video_pipeline is not None
+            and self._vcam_available
+            and not getattr(self._video_pipeline, "_vcam_failed", False)
+        )
+        if pipeline_holds_device and not own_seen:
+            # fuser cannot even see our own fd on the device: it is blind
+            # (user namespace), so its count of others is worthless.
+            return None
+        return count
 
-        if new_count != self._vcam_consumers:
-            self._vcam_consumers = new_count
+    def _check_vcam_consumers(self):
+        """Poll vcam consumers for status display and camera power save.
 
+        The pipeline is never stopped for power save — stopping it while a
+        consumer holds the device breaks v4l2sink with exclusive_caps=1.
+        Idle only pauses the capture leg (camera off, vcam device stays
+        open), and it errs hard toward "in use": unknown counts as in use,
+        and three consecutive idle verdicts are required before pausing.
+        """
+        if not self._vcam_available or not self._streaming:
+            self._idle_strikes = 0
+            return True  # Keep polling
+
+        consumers = self._probe_vcam_consumers()
+
+        if consumers is not None and consumers != self._vcam_consumers:
+            self._vcam_consumers = consumers
             if self._tray and self._tray.available:
-                status = f"streaming ({new_count} consumer{'s' if new_count != 1 else ''})" if self._streaming else "idle"
+                status = (f"streaming ({consumers} consumer"
+                          f"{'s' if consumers != 1 else ''})"
+                          if self._streaming else "idle")
                 self._tray.update_status(self._streaming, status)
 
+        window_hidden = not (self._window and self._window.get_visible())
+        pipeline = self._video_pipeline
+        can_idle = (
+            getattr(self.config, "auto_idle", True)
+            and pipeline is not None
+            and not pipeline.is_recording
+            and consumers == 0          # None (unknown) never idles
+            and window_hidden
+        )
+
+        if self._idle_active:
+            if not can_idle:
+                self._exit_idle("activity detected")
+            return True
+
+        if can_idle:
+            self._idle_strikes += 1
+            if self._idle_strikes >= 3:
+                self._enter_idle()
+        else:
+            self._idle_strikes = 0
         return True  # Keep polling
+
+    def _enter_idle(self):
+        pipeline = self._video_pipeline
+        if pipeline is None:
+            return
+        if not pipeline.set_capture_idle(True):
+            self._idle_strikes = 0
+            return
+        self._idle_active = True
+        self._idle_strikes = 0
+        if self._tray and self._tray.available:
+            self._tray.update_status(self._streaming, "power save (camera unused)")
+        # Fast wake poll: a consumer must never wait on the 10s status
+        # poll. The inotify monitor also wakes us event-driven; this tick
+        # is belt-and-braces (and covers window-shown).
+        GLib.timeout_add(1000, self._idle_wake_tick)
+
+    def _exit_idle(self, reason: str):
+        self._idle_active = False
+        self._idle_strikes = 0
+        pipeline = self._video_pipeline
+        if pipeline is not None:
+            pipeline.set_capture_idle(False)
+        print(f"[NV Broadcast] Power save resumed: {reason}", flush=True)
+        if self._tray and self._tray.available:
+            self._tray.update_status(self._streaming, "streaming")
+
+    def _on_vcam_consumer_wake(self):
+        """Called from the monitor thread on a sustained device open."""
+        GLib.idle_add(self._wake_from_vcam_monitor)
+
+    def _wake_from_vcam_monitor(self):
+        if self._idle_active:
+            self._exit_idle("consumer detected (v4l2 event)")
+        return False  # One-shot idle source
+
+    def _idle_wake_tick(self):
+        """1s wake poll while idle. Any doubt resumes the camera."""
+        if not self._idle_active:
+            return False  # Stop this timer
+        consumers = self._probe_vcam_consumers()
+        window_visible = bool(self._window and self._window.get_visible())
+        if consumers != 0 or window_visible:
+            self._exit_idle("consumer detected" if not window_visible
+                            else "window shown")
+            return False
+        return True
+
+    def set_auto_idle(self, enabled: bool):
+        """Toggle camera + mic power save from the UI."""
+        self.config.auto_idle = bool(enabled)
+        save_config(self.config)
+        if not enabled and self._idle_active:
+            self._exit_idle("power save disabled")
+        self._idle_strikes = 0
+        # The audio helper reads auto_idle from its spawn state — restart
+        # it so the mic-side monitor follows the new setting.
+        if self._audio_pipeline is not None:
+            self._audio_pipeline.auto_idle = bool(enabled)
+            self._restart_audio_pipeline_for_live_settings()
 
     def _preload_effects(self):
         """Pre-initialize AI models in background to eliminate first-use delay."""
@@ -558,6 +738,7 @@ class NVBroadcastApp(Adw.Application):
 
     def _auto_start(self):
         """Auto-start broadcast with saved settings."""
+        startup_trace.mark("auto-start begin")
         print(f"[NV Broadcast] Auto-start: streaming={self._streaming} vcam={self._vcam_available}", flush=True)
         if not self._streaming:
             camera = self.config.video.camera_device
@@ -614,6 +795,8 @@ class NVBroadcastApp(Adw.Application):
             self._video_effects.set_background_image(c.video.background_image)
         self._video_effects.mode = c.video.background_mode
         self._video_effects.intensity = c.video.blur_intensity
+        self._video_effects.blur_dim = getattr(c.video, "blur_dim", 0.0)
+        self._video_effects.blur_desaturate = getattr(c.video, "blur_desaturate", 0.0)
 
         # Tell window to restore UI controls FIRST (may fire toggle callbacks)
         self._window.restore_settings(c)
@@ -623,6 +806,8 @@ class NVBroadcastApp(Adw.Application):
         self._video_effects.enabled = c.video.background_removal
         self._video_effects.mode = c.video.background_mode
         self._video_effects.intensity = c.video.blur_intensity
+        self._video_effects.blur_dim = getattr(c.video, "blur_dim", 0.0)
+        self._video_effects.blur_desaturate = getattr(c.video, "blur_desaturate", 0.0)
         if c.video.background_image:
             self._video_effects.set_background_image(c.video.background_image)
         self._eye_contact.enabled = c.video.eye_contact
@@ -643,6 +828,8 @@ class NVBroadcastApp(Adw.Application):
 
         if self._audio_pipeline_should_publish() or c.audio.noise_removal or c.audio.voice_fx_enabled:
             audio_pipeline = self._ensure_audio_pipeline()
+            audio_pipeline.auto_idle = getattr(c, "auto_idle", True)
+            audio_pipeline.effects.engine = c.audio.noise_engine
             audio_pipeline.effects.enabled = c.audio.noise_removal
             audio_pipeline.effects.intensity = c.audio.noise_intensity
             audio_pipeline.voice_fx.enabled = c.audio.voice_fx_enabled
@@ -804,6 +991,7 @@ class NVBroadcastApp(Adw.Application):
             self._queue_pipeline_restart()
             return False
 
+        startup_trace.mark("start_pipeline begin")
         from nvbroadcast.core.config import PERFORMANCE_PROFILES
         from nvbroadcast.video.virtual_camera import resolve_camera_device, select_camera_mode
 
@@ -852,6 +1040,7 @@ class NVBroadcastApp(Adw.Application):
             save_config(self.config)
         effects_fps = max(5, int(profile.get("effects_ratio", 1.0) * camera_fps))
 
+        startup_trace.mark("camera modes probed")
         self._video_pipeline = VideoPipeline()
         self._video_pipeline.configure(
             source_device=camera_device,
@@ -867,6 +1056,18 @@ class NVBroadcastApp(Adw.Application):
         self._video_pipeline.set_effect_callback(self._process_frame)
         self._video_pipeline.set_alpha_callback(self._update_alpha)
         self._video_pipeline.set_alpha_worker_enabled(not self._inline_inference)
+        if (self._gpu_frame_path is None and not self._gpu_frame_path_failed
+                and not IS_MACOS
+                and os.getenv("NVBROADCAST_NO_GPU_FRAME_PATH") != "1"):
+            from nvbroadcast.video.gpu_frame_path import GpuFramePath
+            self._gpu_frame_path = GpuFramePath.create(
+                self._video_effects, gpu_index=self.config.compute_gpu)
+            if self._gpu_frame_path is None:
+                self._gpu_frame_path_failed = True
+        if self._gpu_frame_path is not None:
+            self._video_pipeline.set_frame_processor(
+                self._gpu_frame_path, self._gpu_frame_plan)
+        startup_trace.mark("gpu frame path ready")
         self._video_pipeline.set_preview_callback(
             lambda texture: self._window.update_preview(texture)
         )
@@ -888,7 +1089,9 @@ class NVBroadcastApp(Adw.Application):
 
         try:
             self._video_pipeline.build(vcam_enabled=self._vcam_available)
+            startup_trace.mark("pipeline built")
             self._video_pipeline.start()
+            startup_trace.mark("pipeline started")
             self._streaming = True
 
             w, h = self.config.video.width, self.config.video.height
@@ -915,6 +1118,8 @@ class NVBroadcastApp(Adw.Application):
     def stop_pipeline(self, clear_pending_start: bool = True):
         if clear_pending_start:
             self._pending_start = None
+        self._idle_active = False
+        self._idle_strikes = 0
         if self._restart_source_id:
             GLib.source_remove(self._restart_source_id)
             self._restart_source_id = 0
@@ -932,6 +1137,26 @@ class NVBroadcastApp(Adw.Application):
         """Background thread — only updates the alpha mask."""
         self._video_effects.update_alpha(frame_data, width, height)
 
+    def _gpu_frame_plan(self):
+        """Per-frame routing for the device-resident path.
+
+        Returns (gpu_pure, mirror, inline_inference). gpu_pure means every
+        active stage runs on the GPU; any CPU face stage routes the frame
+        through the legacy bytes callback instead (still convert-free).
+        """
+        face_fx = (
+            self._beautifier.enabled
+            or self._eye_contact.enabled
+            or self._relighter.enabled
+        )
+        gpu_pure = (
+            not face_fx
+            and not self._autoframe.enabled
+            and self._video_effects.enabled
+            and self._video_effects.gpu_output_eligible()
+        )
+        return gpu_pure, self._mirror, self._inline_inference
+
     def _process_frame(self, frame_data: bytes, width: int, height: int) -> bytes:
         """Inline callback — processes EVERY frame with ALL effects.
         Runs composite + face effects + mirror on the current frame."""
@@ -940,17 +1165,22 @@ class NVBroadcastApp(Adw.Application):
 
         self._perf_monitor.tick()
         frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(height, width, 4)
-        if not frame.flags.writeable:
-            frame = frame.copy()
-        result_frame = frame
-        landmarks = None
-        fused_beautify_overlay = False
 
         face_effects_active = (
             self._beautifier.enabled
             or self._eye_contact.enabled
             or self._relighter.enabled
         )
+        # Only pay the ~8MB writeable copy when a CPU stage might mutate
+        # the raw frame; the GPU blur path reads it exactly once, and the
+        # effects processor makes its own copy for remove/replace modes.
+        if not frame.flags.writeable and (
+            face_effects_active or self._autoframe.enabled
+        ):
+            frame = frame.copy()
+        result_frame = frame
+        landmarks = None
+        fused_beautify_overlay = False
         if face_effects_active:
             landmarker = get_shared_landmarker()
             raw_frame = result_frame
@@ -984,11 +1214,21 @@ class NVBroadcastApp(Adw.Application):
 
         # Inline-inference profiles own the alpha path entirely. The pipeline
         # disables the background alpha worker in that mode to avoid cache races.
+        # Mirror on-GPU only when no CPU stage runs after compositing —
+        # later stages would otherwise operate on an already-flipped frame.
+        gpu_mirror = (
+            self._mirror
+            and not face_effects_active
+            and not self._autoframe.enabled
+            and self._video_effects.enabled
+        )
         if self._video_effects.enabled:
             if self._inline_inference:
-                result_frame = self._video_effects.process_frame_array(result_frame, width, height)
+                result_frame = self._video_effects.process_frame_array(
+                    result_frame, width, height, mirror=gpu_mirror)
             else:
-                result_frame = self._video_effects.composite_only_array(result_frame, width, height)
+                result_frame = self._video_effects.composite_only_array(
+                    result_frame, width, height, mirror=gpu_mirror)
 
         if face_effects_active:
             if self._beautifier.enabled:
@@ -1015,8 +1255,10 @@ class NVBroadcastApp(Adw.Application):
         if self._autoframe.enabled:
             result_frame = self._autoframe.process_frame_array(result_frame, width, height)
 
-        # Mirror flip
-        if self._mirror:
+        # Mirror flip (skipped when the fused GPU path already flipped)
+        if self._mirror and not (
+            gpu_mirror and self._video_effects.last_output_mirrored
+        ):
             result_frame = cv2.flip(result_frame, 1)
         return result_frame.tobytes()
 
@@ -1109,6 +1351,16 @@ class NVBroadcastApp(Adw.Application):
     def set_blur_intensity(self, value: float):
         self._video_effects.intensity = value
         self.config.video.blur_intensity = value
+        save_config(self.config)
+
+    def set_blur_dim(self, value: float):
+        self._video_effects.blur_dim = value
+        self.config.video.blur_dim = value
+        save_config(self.config)
+
+    def set_blur_desaturate(self, value: float):
+        self._video_effects.blur_desaturate = value
+        self.config.video.blur_desaturate = value
         save_config(self.config)
 
     def set_performance_profile(self, profile_name: str, compositing: str | None = None,
@@ -1839,6 +2091,8 @@ class NVBroadcastApp(Adw.Application):
         videos_dir.mkdir(exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filepath = str(videos_dir / f"NVBroadcast_{timestamp}.mp4")
+        if self._idle_active:
+            self._exit_idle("recording started")
         if self._video_pipeline:
             self._video_pipeline.start_recording(filepath)
         self._last_recording_path = filepath
@@ -2240,8 +2494,18 @@ class NVBroadcastApp(Adw.Application):
     def set_noise_removal(self, enabled: bool):
         self.config.audio.noise_removal = enabled
         pipeline = self._ensure_audio_pipeline()
+        pipeline.effects.engine = self.config.audio.noise_engine
         pipeline.effects.enabled = enabled
         self._refresh_audio_pipeline()
+        save_config(self.config)
+
+    def set_noise_engine(self, engine: str):
+        """Switch the denoiser engine ("auto" = DeepFilterNet, "rnnoise")."""
+        engine = engine if engine in ("auto", "rnnoise") else "auto"
+        self.config.audio.noise_engine = engine
+        pipeline = self._ensure_audio_pipeline()
+        pipeline.effects.engine = engine
+        self._restart_audio_pipeline_for_live_settings()
         save_config(self.config)
 
     def set_noise_intensity(self, value: float):
@@ -2333,6 +2597,9 @@ class NVBroadcastApp(Adw.Application):
 
     def do_shutdown(self):
         save_config(self.config)
+        if self._vcam_monitor:
+            self._vcam_monitor.stop()
+            self._vcam_monitor = None
         if self._meeting_capture:
             self._meeting_capture.stop()
             self._meeting_capture = None

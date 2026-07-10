@@ -5,6 +5,7 @@
 #
 """User configuration management - persists all settings across sessions."""
 
+import os
 import tomllib
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -46,6 +47,8 @@ class VideoConfig:
     background_mode: str = "blur"
     background_image: str = ""
     blur_intensity: float = 0.7
+    blur_dim: float = 0.0          # Darken the blurred background (0..1)
+    blur_desaturate: float = 0.0   # Desaturate the blurred background (0..1)
     auto_frame: bool = False
     auto_frame_zoom: float = 1.5
     auto_frame_mode: str = "center"
@@ -64,6 +67,8 @@ class AudioConfig:
     speaker_device: str = ""
     noise_removal: bool = False
     noise_intensity: float = 1.0
+    # "auto" = DeepFilterNet3 neural denoiser when available, else RNNoise
+    noise_engine: str = "auto"
     speaker_denoise: bool = False
     voice_fx_enabled: bool = False
     voice_fx_use_gpu: bool = True
@@ -133,9 +138,9 @@ COMPOSITING_BACKENDS = {
         "requires": [],
     },
     "gstreamer_gl": {
-        "label": "GStreamer OpenGL (GPU — recommended)",
-        "description": "GPU blur + blend via OpenGL — dramatically reduces CPU usage",
-        "requires": ["glvideomixer", "gleffects_blur", "glupload"],
+        "label": "GPU (auto)",
+        "description": "CuPy CUDA compositing when available, otherwise CPU",
+        "requires": [],
     },
     "cupy": {
         "label": "CuPy CUDA (GPU — maximum performance)",
@@ -158,6 +163,8 @@ class AppConfig:
     use_fused_kernel: bool = False
     use_nvdec: bool = False
     auto_start: bool = True
+    # Pause the camera when the window is hidden and no app reads the vcam
+    auto_idle: bool = True
     minimize_on_close: bool = True
     check_for_updates: bool = True
     last_update_check: int = 0
@@ -200,7 +207,7 @@ def _load_from_toml(filepath: Path) -> AppConfig:
               "mode_key", "premium_edge_refine",
               "auto_mode",
               "use_tensorrt", "use_fused_kernel", "use_nvdec",
-              "auto_start", "minimize_on_close", "check_for_updates",
+              "auto_start", "auto_idle", "minimize_on_close", "check_for_updates",
               "last_update_check", "last_notified_version",
               "last_python_runtime_notice", "first_run",
               "current_profile"):
@@ -284,12 +291,28 @@ def _load_from_toml(filepath: Path) -> AppConfig:
 
 
 def load_config() -> AppConfig:
+    """Load the config, falling back to the last-good backup on corruption.
+
+    Silently defaulting on a parse error loses every user setting the
+    moment anything re-saves — a truncated write (crash mid-save) used to
+    wipe the config invisibly.
+    """
     if not CONFIG_FILE.exists():
         return AppConfig()
     try:
         return _load_from_toml(CONFIG_FILE)
-    except Exception:
-        return AppConfig()
+    except Exception as e:
+        print(f"[NV Broadcast] Config file unreadable ({e}); "
+              f"trying backup", flush=True)
+    backup = CONFIG_FILE.with_suffix(".toml.bak")
+    try:
+        if backup.exists():
+            config = _load_from_toml(backup)
+            print("[NV Broadcast] Restored settings from config backup", flush=True)
+            return config
+    except Exception as e:
+        print(f"[NV Broadcast] Config backup also unreadable ({e})", flush=True)
+    return AppConfig()
 
 
 def _bool(val: bool) -> str:
@@ -314,6 +337,7 @@ def _config_to_toml(config: AppConfig) -> str:
         f"use_fused_kernel = {_bool(config.use_fused_kernel)}",
         f"use_nvdec = {_bool(config.use_nvdec)}",
         f"auto_start = {_bool(config.auto_start)}",
+        f"auto_idle = {_bool(config.auto_idle)}",
         f"minimize_on_close = {_bool(config.minimize_on_close)}",
         f"check_for_updates = {_bool(config.check_for_updates)}",
         f"last_update_check = {config.last_update_check}",
@@ -334,6 +358,8 @@ def _config_to_toml(config: AppConfig) -> str:
         f'background_mode = "{v.background_mode}"',
         f'background_image = "{v.background_image}"',
         f"blur_intensity = {v.blur_intensity}",
+        f"blur_dim = {v.blur_dim}",
+        f"blur_desaturate = {v.blur_desaturate}",
         f"auto_frame = {_bool(v.auto_frame)}",
         f"auto_frame_zoom = {v.auto_frame_zoom}",
         f'auto_frame_mode = "{v.auto_frame_mode}"',
@@ -363,6 +389,7 @@ def _config_to_toml(config: AppConfig) -> str:
         f'speaker_device = "{a.speaker_device}"',
         f"noise_removal = {_bool(a.noise_removal)}",
         f"noise_intensity = {a.noise_intensity}",
+        f'noise_engine = "{a.noise_engine}"',
         f"speaker_denoise = {_bool(a.speaker_denoise)}",
         f"voice_fx_enabled = {_bool(a.voice_fx_enabled)}",
         f"voice_fx_use_gpu = {_bool(a.voice_fx_use_gpu)}",
@@ -382,8 +409,21 @@ def _config_to_toml(config: AppConfig) -> str:
 
 
 def save_config(config: AppConfig) -> None:
+    """Atomically persist the config and keep the previous file as backup.
+
+    write_text truncates in place, so a crash mid-save left a corrupt file
+    and the next start silently reset every setting. Write to a temp file
+    and rename over the target instead; rename is atomic on POSIX.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(_config_to_toml(config))
+    if CONFIG_FILE.exists():
+        try:
+            os.replace(CONFIG_FILE, CONFIG_FILE.with_suffix(".toml.bak"))
+        except OSError:
+            pass
+    tmp = CONFIG_FILE.with_suffix(".toml.tmp")
+    tmp.write_text(_config_to_toml(config))
+    os.replace(tmp, CONFIG_FILE)
 
 
 # ─── User Profiles ───────────────────────────────────────────────────────────
@@ -599,20 +639,6 @@ def detect_compositing_backends() -> dict[str, bool]:
     """Detect which compositing backends are available on this system."""
     available = {"cpu": True}
 
-    # Check GStreamer GL
-    try:
-        import gi
-        gi.require_version("Gst", "1.0")
-        from gi.repository import Gst
-        Gst.init(None)
-        gl_ok = all(
-            Gst.ElementFactory.find(e) is not None
-            for e in ["glvideomixer", "glupload", "gldownload"]
-        )
-        available["gstreamer_gl"] = gl_ok
-    except Exception:
-        available["gstreamer_gl"] = False
-
     # Check complete CUDA mode runtime: CuPy compositing plus ONNX CUDA inference.
     from nvbroadcast.core.platform import has_cuda_inference_runtime, supports_linux_gpu_stack
     if supports_linux_gpu_stack():
@@ -623,6 +649,11 @@ def detect_compositing_backends() -> dict[str, bool]:
             available["cupy"] = False
     else:
         available["cupy"] = False
+
+    # "gstreamer_gl" is a legacy config value that never built a GL pipeline;
+    # it resolves to CuPy compositing when available, else CPU — so it is
+    # always usable.
+    available["gstreamer_gl"] = True
 
     return available
 

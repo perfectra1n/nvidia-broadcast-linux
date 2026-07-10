@@ -8,6 +8,7 @@
 import base64
 import json
 import os
+from pathlib import Path
 import queue
 import signal
 import subprocess
@@ -24,6 +25,7 @@ import numpy as np
 
 from nvbroadcast.audio.effects import AudioEffects
 from nvbroadcast.audio.virtual_mic import (
+    VIRTUAL_MIC_SOURCE_NAME,
     create_virtual_mic,
     destroy_virtual_mic,
     has_virtual_mic_backend,
@@ -76,9 +78,16 @@ class AudioPipeline:
             use_helper_process = IS_LINUX and has_virtual_mic_backend() and not disable_helper
         self._use_helper_process = bool(use_helper_process)
         self._output_frames_pushed = 0
+        self._stereo_scratch: np.ndarray | None = None
         self._output_buffer_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=64)
         self._output_worker: threading.Thread | None = None
         self._stop_output_worker = threading.Event()
+        # Mic power save: pause capture while nothing records from the
+        # virtual mic. Mirrors the video camera power save.
+        self.auto_idle = True
+        self._audio_idle = False
+        self._idle_monitor: threading.Thread | None = None
+        self._idle_monitor_stop = threading.Event()
         self._debug_audio = os.getenv("NVBROADCAST_AUDIO_DEBUG", "").strip().lower() in {
             "1",
             "true",
@@ -138,10 +147,21 @@ class AudioPipeline:
     def _build_capture_pipeline(self) -> Gst.Pipeline:
         pipeline = Gst.Pipeline.new("nvbroadcast-audio-input")
 
+        # Bigger capture blocks halve per-block Python/queue/pipe overhead
+        # (the denoiser still runs its fixed 10ms hops internally). 20ms
+        # stays inside the pacat --latency-msec 40 output budget.
+        try:
+            block_ms = max(5, min(40, int(
+                os.getenv("NVBROADCAST_AUDIO_BLOCK_MS", "20"))))
+        except ValueError:
+            block_ms = 20
+
         if IS_LINUX and self._virtual_mic_backend == "pulse":
             source = Gst.ElementFactory.make("pulsesrc", "mic-source")
             if self._mic_device:
                 source.set_property("device", self._mic_device)
+            source.set_property("latency-time", block_ms * 1000)
+            source.set_property("buffer-time", block_ms * 4000)
         else:
             source = Gst.ElementFactory.make("pipewiresrc", "mic-source")
             if self._mic_device:
@@ -149,9 +169,11 @@ class AudioPipeline:
             source.set_property("do-timestamp", True)
             source.set_property("min-buffers", 2)
             source.set_property("max-buffers", 4)
+            block_frames = (self._sample_rate * block_ms) // 1000
             source.set_property(
                 "stream-properties",
-                Gst.Structure.new_from_string("properties,node.latency=1024/48000"),
+                Gst.Structure.new_from_string(
+                    f"properties,node.latency={block_frames}/{self._sample_rate}"),
             )
 
         convert_in = Gst.ElementFactory.make("audioconvert", "convert-in")
@@ -250,47 +272,55 @@ class AudioPipeline:
         if not success:
             return Gst.FlowReturn.OK
 
-        audio = np.frombuffer(map_info.data, dtype=np.float32).copy()
-        buf.unmap(map_info)
+        # Read-only view into the mapped buffer — the map is held for the
+        # whole (synchronous) processing chain, so the hot path pays no
+        # full-block copy. Only the transcriber retains audio past this
+        # callback and gets an owned copy.
+        audio = np.frombuffer(map_info.data, dtype=np.float32)
+        try:
+            if self._transcriber_feed is not None:
+                audio = audio.copy()
 
-        if self._level_monitor:
-            self._level_monitor.update(audio)
+            if self._level_monitor:
+                self._level_monitor.update(audio)
 
-        if self._transcriber_feed:
-            try:
-                self._transcriber_feed.feed_audio(audio, self._sample_rate)
-            except Exception:
-                pass
+            if self._transcriber_feed:
+                try:
+                    self._transcriber_feed.feed_audio(audio, self._sample_rate)
+                except Exception:
+                    pass
 
-        processed = self._effects.process_chunk(audio, self._sample_rate)
-        if self._voice_fx and self._voice_fx.enabled:
-            processed = self._voice_fx.process_chunk(
-                processed,
-                self._sample_rate,
-                gate_reference=audio,
-            )
+            processed = self._effects.process_chunk(audio, self._sample_rate)
+            if self._voice_fx and self._voice_fx.enabled:
+                processed = self._voice_fx.process_chunk(
+                    processed,
+                    self._sample_rate,
+                    gate_reference=audio,
+                )
 
-        if self._uses_loopback_virtual_mic:
-            output_state = self._enqueue_output_audio(processed)
-        else:
-            output_state = self._push_buffer_direct(processed)
+            if self._uses_loopback_virtual_mic:
+                output_state = self._enqueue_output_audio(processed)
+            else:
+                output_state = self._push_buffer_direct(processed)
 
-        if self._debug_audio and self._debug_audio_buffers < 40:
-            self._debug_audio_buffers += 1
-            in_rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
-            out_rms = float(np.sqrt(np.mean(np.square(processed)))) if len(processed) else 0.0
-            in_peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-            out_peak = float(np.max(np.abs(processed))) if len(processed) else 0.0
-            print(
-                "[NVIDIA Broadcast Audio Debug] "
-                f"in_frames={len(audio)} out_frames={len(processed)} "
-                f"in_rms={in_rms:.6f} out_rms={out_rms:.6f} "
-                f"in_peak={in_peak:.6f} out_peak={out_peak:.6f} "
-                f"buf_duration_ms="
-                f"{(buf.duration / Gst.MSECOND) if buf.duration not in (None, Gst.CLOCK_TIME_NONE) else None} "
-                f"output_state={output_state}",
-                flush=True,
-            )
+            if self._debug_audio and self._debug_audio_buffers < 40:
+                self._debug_audio_buffers += 1
+                in_rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+                out_rms = float(np.sqrt(np.mean(np.square(processed)))) if len(processed) else 0.0
+                in_peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+                out_peak = float(np.max(np.abs(processed))) if len(processed) else 0.0
+                print(
+                    "[NVIDIA Broadcast Audio Debug] "
+                    f"in_frames={len(audio)} out_frames={len(processed)} "
+                    f"in_rms={in_rms:.6f} out_rms={out_rms:.6f} "
+                    f"in_peak={in_peak:.6f} out_peak={out_peak:.6f} "
+                    f"buf_duration_ms="
+                    f"{(buf.duration / Gst.MSECOND) if buf.duration not in (None, Gst.CLOCK_TIME_NONE) else None} "
+                    f"output_state={output_state}",
+                    flush=True,
+                )
+        finally:
+            buf.unmap(map_info)
         return Gst.FlowReturn.OK
 
     def _push_buffer_direct(self, processed: np.ndarray):
@@ -300,11 +330,18 @@ class AudioPipeline:
                 return f"process-exited={self._output_process.returncode}"
             if self._output_process.stdin is None:
                 return "no-process-stdin"
-            stereo = np.repeat(processed.astype(np.float32, copy=False), 2)
-            payload = stereo.tobytes()
+            mono = processed.astype(np.float32, copy=False)
+            n = len(mono)
+            stereo = self._stereo_scratch
+            if stereo is None or len(stereo) < 2 * n:
+                stereo = np.empty(max(2 * n, 4096), dtype=np.float32)
+                self._stereo_scratch = stereo
+            stereo[0:2 * n:2] = mono
+            stereo[1:2 * n:2] = mono
+            payload = memoryview(stereo)[:2 * n]
             try:
                 self._output_process.stdin.write(payload)
-                return f"wrote={len(payload)}"
+                return f"wrote={payload.nbytes}"
             except (BrokenPipeError, OSError) as exc:
                 return f"write-failed={exc.__class__.__name__}"
 
@@ -323,8 +360,18 @@ class AudioPipeline:
         return self._appsrc.emit("push-buffer", new_buf)
 
     def _enqueue_output_audio(self, processed: np.ndarray) -> str:
-        """Queue processed audio for the dedicated output worker."""
-        chunk = np.array(processed, dtype=np.float32, copy=True)
+        """Queue processed audio for the dedicated output worker.
+
+        The worker consumes asynchronously, so the queued chunk must own its
+        data — a view into GStreamer-mapped memory would dangle after unmap.
+        The denoiser already returns owned copies; only pass-through views
+        (effects off) and voice-FX scratch outputs still need the copy.
+        """
+        if (processed.dtype == np.float32 and processed.flags.owndata
+                and not (self._voice_fx and self._voice_fx.enabled)):
+            chunk = processed
+        else:
+            chunk = np.array(processed, dtype=np.float32)
         try:
             self._output_buffer_queue.put(chunk, timeout=0.25)
         except queue.Full:
@@ -530,6 +577,8 @@ class AudioPipeline:
             "sample_rate": self._sample_rate,
             "noise_removal": self._effects.enabled,
             "noise_intensity": self._effects.intensity,
+            "noise_engine": self._effects.engine,
+            "auto_idle": self.auto_idle,
             "voice_fx_enabled": self.voice_fx.enabled,
             "voice_fx_use_gpu": self.voice_fx.use_gpu,
             "voice_fx_settings": {
@@ -550,7 +599,18 @@ class AudioPipeline:
         self._stop_stale_helper_processes()
         state_json = json.dumps(self._helper_state(), separators=(",", ":")).encode("utf-8")
         state_b64 = base64.urlsafe_b64encode(state_json).decode("ascii")
-        stdio = None if self._debug_audio else subprocess.DEVNULL
+        if self._debug_audio:
+            stdio = None
+        else:
+            # Keep the helper's diagnostics inspectable — DEVNULL hid
+            # "denoiser failed to initialize" style messages entirely.
+            try:
+                log_dir = Path(os.environ.get("XDG_CACHE_HOME",
+                                              Path.home() / ".cache")) / "nvbroadcast"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                stdio = open(log_dir / "audio-helper.log", "w")
+            except Exception:
+                stdio = subprocess.DEVNULL
         cmd = [
             sys.executable,
             "-m",
@@ -572,6 +632,10 @@ class AudioPipeline:
         except Exception:
             self._helper_process = None
             return False
+        finally:
+            # Popen duplicated the fd; close ours so restarts don't leak.
+            if hasattr(stdio, "close"):
+                stdio.close()
 
         time.sleep(0.2)
         if self._helper_process.poll() is not None:
@@ -612,6 +676,89 @@ class AudioPipeline:
                 pass
         self._output_process = None
 
+    # ─── Mic power save ─────────────────────────────────────────────────
+
+    def _count_virtual_mic_consumers(self) -> int | None:
+        """Count recording streams on the virtual mic source.
+
+        Returns None when the answer is not trustworthy (pactl missing,
+        error, no virtual mic found) — callers MUST treat None as "in use"
+        so a detection failure can never silence someone's microphone.
+        """
+        import json
+        try:
+            srcs = subprocess.run(["pactl", "-f", "json", "list", "sources"],
+                                  capture_output=True, text=True, timeout=2)
+            outs = subprocess.run(["pactl", "-f", "json", "list", "source-outputs"],
+                                  capture_output=True, text=True, timeout=2)
+            if srcs.returncode != 0 or outs.returncode != 0:
+                return None
+            # Count only the remap source apps record from. Substring
+            # matching would also catch nvbroadcast_sink.monitor, which the
+            # remap module itself holds open forever — that made the count
+            # permanently >=1 and power save could never engage.
+            vm_ids = {s.get("index") for s in json.loads(srcs.stdout)
+                      if s.get("name") == VIRTUAL_MIC_SOURCE_NAME}
+            if not vm_ids:
+                return None
+            return sum(1 for o in json.loads(outs.stdout)
+                       if o.get("source") in vm_ids)
+        except Exception:
+            return None
+
+    def _start_idle_monitor(self):
+        if not self.auto_idle or self.uses_helper_process:
+            return
+        if not self._uses_loopback_virtual_mic:
+            return
+        self._audio_idle = False
+        self._idle_monitor_stop.clear()
+        self._idle_monitor = threading.Thread(
+            target=self._idle_monitor_main, daemon=True,
+            name="nvbroadcast-audio-idle")
+        self._idle_monitor.start()
+
+    def _stop_idle_monitor(self):
+        self._idle_monitor_stop.set()
+        self._idle_monitor = None
+        self._audio_idle = False
+
+    def _idle_monitor_main(self):
+        """Idle after 3 consecutive no-consumer checks; wake within 0.5s."""
+        strikes = 0
+        while not self._idle_monitor_stop.wait(0.5 if self._audio_idle else 5.0):
+            if not self._running:
+                strikes = 0
+                continue
+            consumers = self._count_virtual_mic_consumers()
+            if self._audio_idle:
+                if consumers != 0:  # any consumer, or unknown -> resume
+                    self._set_audio_idle(False)
+                    strikes = 0
+            elif consumers == 0:
+                strikes += 1
+                if strikes >= 3:
+                    self._set_audio_idle(True)
+                    strikes = 0
+            else:
+                strikes = 0
+
+    def _set_audio_idle(self, idle: bool):
+        """Pause/resume the mic capture pipeline; the virtual mic device
+        and output transport stay alive so apps keep listing it."""
+        pipeline = self._capture_pipeline or self._pipeline
+        if pipeline is None:
+            return
+        try:
+            target = Gst.State.PAUSED if idle else Gst.State.PLAYING
+            if pipeline.set_state(target) == Gst.StateChangeReturn.FAILURE:
+                return
+            self._audio_idle = idle
+            print(f"[NV Broadcast] Mic capture "
+                  f"{'idled (power save)' if idle else 'resumed'}", flush=True)
+        except Exception as e:
+            print(f"[NV Broadcast] Mic power save toggle failed: {e}", flush=True)
+
     def start(self):
         if self.uses_helper_process:
             if self._manage_virtual_mic and not create_virtual_mic():
@@ -642,6 +789,7 @@ class AudioPipeline:
             self._effects.initialize()
             self._capture_pipeline.set_state(Gst.State.PLAYING)
             self._running = True
+            self._start_idle_monitor()
             return
 
         if self._pipeline:
@@ -653,8 +801,10 @@ class AudioPipeline:
             self._effects.initialize()
             self._pipeline.set_state(Gst.State.PLAYING)
             self._running = True
+            self._start_idle_monitor()
 
     def stop(self):
+        self._stop_idle_monitor()
         capture_pipeline = self._capture_pipeline
         output_pipeline = self._output_pipeline
         legacy_pipeline = self._pipeline

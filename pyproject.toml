@@ -33,7 +33,10 @@ dependencies = [
     "mediapipe>=0.10",
     "onnxruntime>=1.24.4,<1.25",
     "pyrnnoise>=0.4",
-    "av>=12",
+    # pyrnnoise -> audiolab needs av.option (removed in av 17) AND
+    # Codec.canonical_name (added in av 14); av 18 breaks the denoiser at
+    # import time and noise removal silently becomes a no-op.
+    "av>=16,<17",
     "onnx>=1.14",
     "psutil>=5.9",
     "scipy>=1.11",
@@ -56,6 +59,9 @@ cuda = [
     "nvidia-cufft-cu12",
     "nvidia-nvjitlink-cu12",
     "nvidia-cuda-nvrtc-cu12",
+    # GPU MJPEG decode for the device-resident frame path (optional at
+    # runtime: the pipeline falls back to jpegdec when unavailable).
+    "nvidia-nvimgcodec-cu12",
     "onnxruntime-gpu==1.24.4",
 ]
 meeting = [
@@ -84,6 +90,7 @@ where = ["src"]
 "share/applications" = ["data/com.doczeus.NVBroadcast.desktop"]
 "share/metainfo" = ["data/com.doczeus.NVBroadcast.metainfo.xml"]
 "share/icons/hicolor/scalable/apps" = ["data/icons/com.doczeus.NVBroadcast.svg"]
+"share/icons/hicolor/128x128/apps" = ["data/icons/com.doczeus.NVBroadcast.png"]
 "share/nvbroadcast/backgrounds" = [
     "data/backgrounds/gradient_bg.png",
     "data/backgrounds/studio_bg.png",
